@@ -59,7 +59,7 @@ notebooks = [
     "ipycanvas",
     "ipympl",
     "pycocotools",
-    "decord",
+    "eva-decord; python_version < \"3.12\"",  # video loader; no wheel for 3.12+ (use decord/eva-decord from conda or source if needed)
     "opencv-python",
     "einops",
     "scikit-image",

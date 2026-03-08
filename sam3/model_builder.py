@@ -548,10 +548,18 @@ def _load_checkpoint(model, checkpoint_path):
         )
 
 
+def _get_default_device() -> str:
+    """Return default compute device: MPS (macOS) > CUDA > CPU."""
+    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        return "mps"
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
+
+
 def _setup_device_and_mode(model, device, eval_mode):
     """Setup model device and evaluation mode."""
-    if device == "cuda":
-        model = model.cuda()
+    model = model.to(device)
     if eval_mode:
         model.eval()
     return model
@@ -559,7 +567,7 @@ def _setup_device_and_mode(model, device, eval_mode):
 
 def build_sam3_image_model(
     bpe_path=None,
-    device="cuda" if torch.cuda.is_available() else "cpu",
+    device=None,
     eval_mode=True,
     checkpoint_path=None,
     load_from_HF=True,
@@ -572,7 +580,7 @@ def build_sam3_image_model(
 
     Args:
         bpe_path: Path to the BPE tokenizer vocabulary
-        device: Device to load the model on ('cuda' or 'cpu')
+        device: Device to load the model on ('mps', 'cuda', or 'cpu'). Defaults to MPS on macOS, else CUDA, else CPU.
         eval_mode: Whether to set the model to evaluation mode
         checkpoint_path: Optional path to model checkpoint
         enable_segmentation: Whether to enable segmentation head
@@ -586,6 +594,8 @@ def build_sam3_image_model(
         bpe_path = pkg_resources.resource_filename(
             "sam3", "assets/bpe_simple_vocab_16e6.txt.gz"
         )
+    if device is None:
+        device = _get_default_device()
 
     # Create visual components
     compile_mode = "default" if compile else None
@@ -630,7 +640,9 @@ def build_sam3_image_model(
         eval_mode,
     )
     if load_from_HF and checkpoint_path is None:
-        checkpoint_path = download_ckpt_from_hf()
+        checkpoint_path = _get_local_ckpt_path()
+        if checkpoint_path is None:
+            checkpoint_path = download_ckpt_from_hf()
     # Load checkpoint if provided
     if checkpoint_path is not None:
         _load_checkpoint(model, checkpoint_path)
@@ -641,9 +653,19 @@ def build_sam3_image_model(
     return model
 
 
+SAM3_CKPT_NAME = "sam3.pt"
+
+
+def _get_local_ckpt_path() -> Optional[str]:
+    """Return path to sam3.pt in repo root if present, else None."""
+    # Repo root = parent of package dir (sam3/model_builder.py -> sam3 -> repo root)
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    local_path = os.path.join(repo_root, SAM3_CKPT_NAME)
+    return local_path if os.path.isfile(local_path) else None
+
+
 def download_ckpt_from_hf():
     SAM3_MODEL_ID = "facebook/sam3"
-    SAM3_CKPT_NAME = "sam3.pt"
     SAM3_CFG_NAME = "config.json"
     _ = hf_hub_download(repo_id=SAM3_MODEL_ID, filename=SAM3_CFG_NAME)
     checkpoint_path = hf_hub_download(repo_id=SAM3_MODEL_ID, filename=SAM3_CKPT_NAME)

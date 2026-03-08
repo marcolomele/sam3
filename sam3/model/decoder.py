@@ -272,13 +272,7 @@ class TransformerDecoder(nn.Module):
             self.compilable_stored_size = None
             self.coord_cache = {}
 
-            if resolution is not None and stride is not None:
-                feat_size = resolution // stride
-                coords_h, coords_w = self._get_coords(
-                    feat_size, feat_size, device="cuda"
-                )
-                self.compilable_cord_cache = (coords_h, coords_w)
-                self.compilable_stored_size = (feat_size, feat_size)
+            # Coord cache is filled lazily in _get_rpb_matrix using input device (MPS/CUDA/CPU)
 
         self.roi_pooler = (
             RoIAlign(output_size=7, spatial_scale=1, sampling_ratio=-1, aligned=True)

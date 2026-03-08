@@ -63,18 +63,20 @@ def call_sam_service(
     text_prompt_for_save_path = (
         text_prompt.replace("/", "_") if "/" in text_prompt else text_prompt
     )
+    # Safe dir name: absolute paths like /Users/... must not become -Users-... (leading hyphen)
+    image_path_safe = os.path.normpath(image_path).lstrip(os.sep).replace(os.sep, "-")
 
     os.makedirs(
-        os.path.join(output_folder_path, image_path.replace("/", "-")), exist_ok=True
+        os.path.join(output_folder_path, image_path_safe), exist_ok=True
     )
     output_json_path = os.path.join(
         output_folder_path,
-        image_path.replace("/", "-"),
+        image_path_safe,
         rf"{text_prompt_for_save_path}.json",
     )
     output_image_path = os.path.join(
         output_folder_path,
-        image_path.replace("/", "-"),
+        image_path_safe,
         rf"{text_prompt_for_save_path}.png",
     )
 
@@ -135,5 +137,6 @@ def call_sam_service(
         print("✅ Saved visualization at:", output_image_path)
     except Exception as e:
         print(f"❌ Error calling service: {e}")
+        raise
 
     return output_json_path

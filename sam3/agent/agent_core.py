@@ -213,10 +213,72 @@ def agent_inference(
             .strip()
             .replace(r"}}}", r"}}")  # remove extra } if any
         )
-        try:
-            tool_call = json.loads(tool_call_json_str)
-        except json.JSONDecodeError:
-            raise ValueError(f"Invalid JSON in tool call: {tool_call_json_str}")
+
+        tool_call = None
+        for parse_attempt in range(2):
+            try:
+                tool_call = json.loads(tool_call_json_str)
+                break
+            except json.JSONDecodeError:
+                if parse_attempt == 0:
+                    # Retry once: ask the model to return valid JSON inside <tool></tool>
+                    format_reminder = (
+                        "Your response must include exactly one tool call as valid JSON between <tool> and </tool>. "
+                        'Example: <tool> {"name": "segment_phrase", "parameters": {"text_prompt": "child"}} </tool>. '
+                        "Do not put any description or prose inside the <tool> tags—only the JSON object."
+                    )
+                    messages.append(
+                        {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": generated_text}],
+                        }
+                    )
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": [{"type": "text", "text": format_reminder}],
+                        }
+                    )
+                    generated_text = send_generate_request(messages)
+                    if generated_text is None:
+                        raise ValueError(
+                            f"Invalid JSON in tool call (and retry returned None): {tool_call_json_str}"
+                        )
+                    print(
+                        f"\n>>> MLLM Response (retry) [start]\n{generated_text}\n<<< MLLM Response (retry) [end]\n"
+                    )
+                    assert (
+                        "<tool>" in generated_text,
+                        f"Generated text does not contain <tool> tag: {generated_text}",
+                    )
+                    generated_text = generated_text.split("</tool>", 1)[0] + "</tool>"
+                    tool_call_json_str = (
+                        generated_text.split("<tool>")[-1]
+                        .split("</tool>")[0]
+                        .strip()
+                        .replace(r"}}}", r"}}")
+                    )
+                else:
+                    break
+
+        if tool_call is None:
+            # Fallback: on first turn, if content looks like prose (not JSON), use initial prompt as segment_phrase
+            if (
+                PATH_TO_LATEST_OUTPUT_JSON == ""
+                and not tool_call_json_str.strip().startswith("{")
+            ):
+                print(
+                    "Warning: MLLM did not return valid tool JSON (prose inside <tool>). "
+                    "Using initial prompt as segment_phrase text_prompt."
+                )
+                tool_call = {
+                    "name": "segment_phrase",
+                    "parameters": {"text_prompt": initial_text_prompt},
+                }
+            else:
+                raise ValueError(
+                    f"Invalid JSON in tool call: {tool_call_json_str}"
+                )
 
         if PATH_TO_LATEST_OUTPUT_JSON == "":
             # The first tool call must be segment_phrase or report_no_mask
