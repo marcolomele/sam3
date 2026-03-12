@@ -3,6 +3,7 @@
 # pyre-unsafe
 
 import copy
+import datetime
 import json
 import os
 
@@ -14,37 +15,12 @@ from .client_sam3 import call_sam_service
 from .viz import visualize
 
 
-def save_debug_messages(messages_list, debug, debug_folder_path, debug_jsonl_path):
-    """Save messages to debug jsonl file if debug is enabled"""
-    if debug and debug_jsonl_path:
-        # Ensure the debug directory exists before writing
-        os.makedirs(debug_folder_path, exist_ok=True)
-        with open(debug_jsonl_path, "w") as f:
-            for msg in messages_list:
-                f.write(json.dumps(msg, indent=4) + "\n")
-
-
-def cleanup_debug_files(debug, debug_folder_path, debug_jsonl_path):
-    """Clean up debug files when function successfully returns"""
-    if debug and debug_folder_path:
-        try:
-            if os.path.exists(debug_jsonl_path):
-                os.remove(debug_jsonl_path)
-            if os.path.exists(debug_folder_path):
-                os.rmdir(debug_folder_path)
-        except Exception as e:
-            print(f"Warning: Could not clean up debug files: {e}")
-
-
 def count_images(messages):
     """Count the total number of images present in the messages history."""
     total = 0
     for message in messages:
-        # Check if message has content (should be a list)
         if "content" in message and isinstance(message["content"], list):
-            # Iterate through each content item
             for content_item in message["content"]:
-                # Check if content item is a dict with type "image"
                 if (
                     isinstance(content_item, dict)
                     and content_item.get("type") == "image"
@@ -124,7 +100,7 @@ def _prune_messages_for_next_round(
 def agent_inference(
     img_path: str,
     initial_text_prompt: str,
-    debug: bool = False,
+    debug: bool = True,
     send_generate_request=send_generate_request,
     call_sam_service=call_sam_service,
     max_generations: int = 100,
@@ -137,16 +113,25 @@ def agent_inference(
     Args:
         img_path: Path to the input image
         initial_text_prompt: Initial text prompt from the user
-        debug: Whether to enable debug mode
+        debug: Whether to enable debug mode. When True, per-mask intermediate images (individual
+               masks and zoomed views from examine_each_mask) are saved and their paths are
+               included in full_history.json.
         max_generations: Maximum number of send_generate_request calls allowed (default: 100)
     """
-    # setup dir
+    # setup top-level dirs
     sam_output_dir = os.path.join(output_dir, "sam_out")
-    error_save_dir = os.path.join(output_dir, "none_out")
-    debug_save_dir = os.path.join(output_dir, "agent_debug_out")
     os.makedirs(sam_output_dir, exist_ok=True)
-    os.makedirs(error_save_dir, exist_ok=True)
-    os.makedirs(debug_save_dir, exist_ok=True)
+
+    # per-run folder: all outputs for this run are isolated here
+    image_stem = os.path.splitext(os.path.basename(img_path))[0]
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_folder = os.path.join(sam_output_dir, f"run_{timestamp}_{image_stem}")
+    os.makedirs(run_folder, exist_ok=True)
+
+    # debug subfolder: always created since images are needed for MLLM checks regardless
+    debug_img_folder = os.path.join(run_folder, "debug")
+    os.makedirs(debug_img_folder, exist_ok=True)
+
     current_dir = os.path.dirname(os.path.abspath(__file__))
     MLLM_SYSTEM_PROMPT_PATH = os.path.join(
         current_dir, "system_prompts/system_prompt.txt"
@@ -154,6 +139,7 @@ def agent_inference(
     ITERATIVE_CHECKING_SYSTEM_PROMPT_PATH = os.path.join(
         current_dir, "system_prompts/system_prompt_iterative_checking.txt"
     )
+
     # init variables
     PATH_TO_LATEST_OUTPUT_JSON = ""
     LATEST_SAM3_TEXT_PROMPT = ""
@@ -162,15 +148,26 @@ def agent_inference(
     )  # Track all previously used text prompts for segment_phrase
     generation_count = 0  # Counter for number of send_generate_request calls
 
-    # debug setup
-    debug_folder_path = None
-    debug_jsonl_path = None
-    if debug:
-        debug_folder_path = os.path.join(
-            debug_save_dir, f"{img_path.rsplit('/', 1)[-1].rsplit('.', 1)[0]}"
-        )
-        debug_jsonl_path = os.path.join(debug_folder_path, "debug_history.json")
-        os.makedirs(debug_folder_path, exist_ok=True)
+    # full_history: the complete, unpruned record of every event in this run.
+    # Never passed to the model. Saved incrementally to disk after each event.
+    full_history = []
+    full_history_path = os.path.join(run_folder, "full_history.json")
+
+    def _save_full_history():
+        with open(full_history_path, "w") as f:
+            json.dump(full_history, f, indent=2)
+
+    # record run metadata as first entry
+    full_history.append(
+        {
+            "type": "run_start",
+            "image": img_path,
+            "query": initial_text_prompt,
+            "timestamp": datetime.datetime.now().isoformat(),
+            "run_folder": run_folder,
+        }
+    )
+    _save_full_history()
 
     # The helper functions are now defined outside the agent_inference function
     with open(MLLM_SYSTEM_PROMPT_PATH, "r") as f:
@@ -201,7 +198,6 @@ def agent_inference(
     generated_text = send_generate_request(messages)
     print(f"\n>>> MLLM Response [start]\n{generated_text}\n<<< MLLM Response [end]\n")
     while generated_text is not None:
-        save_debug_messages(messages, debug, debug_folder_path, debug_jsonl_path)
         assert (
             "<tool>" in generated_text,
             f"Generated text does not contain <tool> tag: {generated_text}",
@@ -287,6 +283,17 @@ def agent_inference(
                 or tool_call["name"] == "report_no_mask"
             )
 
+        # record this MLLM response in full history before dispatching the tool
+        full_history.append(
+            {
+                "type": "mllm_response",
+                "round": generation_count + 1,
+                "response_text": generated_text,
+                "tool_call": tool_call,
+            }
+        )
+        _save_full_history()
+
         if tool_call["name"] == "segment_phrase":
             print("🔍 Calling segment_phrase tool...")
             assert list(tool_call["parameters"].keys()) == ["text_prompt"]
@@ -310,6 +317,15 @@ def agent_inference(
                         "content": [{"type": "text", "text": duplicate_prompt_message}],
                     }
                 )
+                full_history.append(
+                    {
+                        "type": "duplicate_prompt_rejected",
+                        "round": generation_count + 1,
+                        "text_prompt": current_text_prompt,
+                        "previously_used": sorted(list(USED_TEXT_PROMPTS)),
+                    }
+                )
+                _save_full_history()
             else:
                 # Add the text_prompt to the set of used prompts
                 USED_TEXT_PROMPTS.add(current_text_prompt)
@@ -317,7 +333,7 @@ def agent_inference(
                 PATH_TO_LATEST_OUTPUT_JSON = call_sam_service(
                     image_path=img_path,
                     text_prompt=current_text_prompt,
-                    output_folder_path=sam_output_dir,
+                    output_folder_path=run_folder,
                 )
                 sam3_outputs = json.load(open(PATH_TO_LATEST_OUTPUT_JSON, "r"))
                 sam3_output_image_path = sam3_outputs["output_image_path"]
@@ -340,6 +356,16 @@ def agent_inference(
                             ],
                         }
                     )
+                    full_history.append(
+                        {
+                            "type": "tool_result",
+                            "round": generation_count + 1,
+                            "tool": "segment_phrase",
+                            "text_prompt": current_text_prompt,
+                            "num_masks": 0,
+                            "sam3_output_json": PATH_TO_LATEST_OUTPUT_JSON,
+                        }
+                    )
                 else:
                     sam3_output_text_message = rf"The segment_phrase tool generated {num_masks} available masks. All {num_masks} available masks are rendered in this image below, now you must analyze the {num_masks} available mask(s) carefully, compare them against the raw input image and the original user query, and determine your next action. Please be reminded that the original user query was '{initial_text_prompt}'."
                     messages.append(
@@ -351,7 +377,19 @@ def agent_inference(
                             ],
                         }
                     )
+                    full_history.append(
+                        {
+                            "type": "tool_result",
+                            "round": generation_count + 1,
+                            "tool": "segment_phrase",
+                            "text_prompt": current_text_prompt,
+                            "num_masks": num_masks,
+                            "sam3_output_json": PATH_TO_LATEST_OUTPUT_JSON,
+                            "sam3_output_image": sam3_output_image_path,
+                        }
+                    )
                 print("\n\n>>> sam3_output_text_message:\n", sam3_output_text_message)
+                _save_full_history()
 
         elif tool_call["name"] == "examine_each_mask":
             print("🔍 Calling examine_each_mask tool...")
@@ -377,18 +415,22 @@ def agent_inference(
             current_outputs = json.load(open(PATH_TO_LATEST_OUTPUT_JSON, "r"))
             num_masks = len(current_outputs["pred_masks"])
             masks_to_keep = []
+            safe_prompt = LATEST_SAM3_TEXT_PROMPT.replace("/", "_")
+            verdicts_log = []
+            debug_images_log = []
 
             # MLLM check the mask one by one
             for i in range(num_masks):
                 print(f"🔍 Checking mask {i + 1}/{num_masks}...")
                 image_w_mask_i, image_w_zoomed_in_mask_i = visualize(current_outputs, i)
 
+                # save to debug subfolder (always needed for MLLM check)
                 image_w_zoomed_in_mask_i_path = os.path.join(
-                    sam_output_dir, rf"{LATEST_SAM3_TEXT_PROMPT}.png".replace("/", "_")
-                ).replace(".png", f"_zoom_in_mask_{i + 1}.png")
+                    debug_img_folder, f"{safe_prompt}_zoom_mask_{i + 1}.png"
+                )
                 image_w_mask_i_path = os.path.join(
-                    sam_output_dir, rf"{LATEST_SAM3_TEXT_PROMPT}.png".replace("/", "_")
-                ).replace(".png", f"_selected_mask_{i + 1}.png")
+                    debug_img_folder, f"{safe_prompt}_mask_{i + 1}.png"
+                )
                 image_w_zoomed_in_mask_i.save(image_w_zoomed_in_mask_i_path)
                 image_w_mask_i.save(image_w_mask_i_path)
 
@@ -435,12 +477,36 @@ def agent_inference(
                     assert not "Reject" in verdict
                     print(f"Mask {i + 1} accepted, keeping it in the outputs.")
                     masks_to_keep.append(i)
+                    verdicts_log.append(
+                        {
+                            "mask_index": i + 1,
+                            "verdict": "Accept",
+                            "reasoning": checking_generated_text,
+                        }
+                    )
                 elif "Reject" in verdict:
                     assert not "Accept" in verdict
                     print(f"Mask {i + 1} rejected, removing it from the outputs.")
+                    verdicts_log.append(
+                        {
+                            "mask_index": i + 1,
+                            "verdict": "Reject",
+                            "reasoning": checking_generated_text,
+                        }
+                    )
                 else:
                     raise ValueError(
                         f"Unexpected verdict in generated text: {checking_generated_text}. Expected 'Accept' or 'Reject'."
+                    )
+
+                # include debug image paths in full_history only when debug=True
+                if debug:
+                    debug_images_log.append(
+                        {
+                            "mask_index": i + 1,
+                            "mask_image": image_w_mask_i_path,
+                            "zoom_image": image_w_zoomed_in_mask_i_path,
+                        }
                     )
 
             updated_outputs = {
@@ -455,15 +521,16 @@ def agent_inference(
             }
 
             image_w_check_masks = visualize(updated_outputs)
+            masks_label = (
+                "-".join(map(str, [i + 1 for i in masks_to_keep]))
+                if masks_to_keep
+                else "none"
+            )
             image_w_check_masks_path = os.path.join(
-                sam_output_dir, rf"{LATEST_SAM3_TEXT_PROMPT}.png"
-            ).replace(
-                ".png",
-                f"_selected_masks_{'-'.join(map(str, [i + 1 for i in masks_to_keep]))}.png".replace(
-                    "/", "_"
-                ),
+                run_folder, f"{safe_prompt}_selected_masks_{masks_label}.png"
             )
             image_w_check_masks.save(image_w_check_masks_path)
+
             # save the updated json outputs and append to message history
             messages.append(
                 {
@@ -513,6 +580,22 @@ def agent_inference(
                 )
             json.dump(updated_outputs, open(PATH_TO_LATEST_OUTPUT_JSON, "w"), indent=4)
 
+            # record examine_each_mask result in full history
+            examine_entry = {
+                "type": "tool_result",
+                "round": generation_count + 1,
+                "tool": "examine_each_mask",
+                "masks_checked": num_masks,
+                "masks_kept": [i + 1 for i in masks_to_keep],
+                "verdicts": verdicts_log,
+                "output_image": image_w_check_masks_path,
+                "updated_output_json": PATH_TO_LATEST_OUTPUT_JSON,
+            }
+            if debug:
+                examine_entry["debug_images"] = debug_images_log
+            full_history.append(examine_entry)
+            _save_full_history()
+
         elif tool_call["name"] == "select_masks_and_return":
             print("🔍 Calling select_masks_and_return tool...")
             current_outputs = json.load(open(PATH_TO_LATEST_OUTPUT_JSON, "r"))
@@ -548,8 +631,23 @@ def agent_inference(
                 }
             )
 
-            # Clean up debug files before successful return
-            cleanup_debug_files(debug, debug_folder_path, debug_jsonl_path)
+            full_history.append(
+                {
+                    "type": "tool_result",
+                    "round": generation_count + 1,
+                    "tool": "select_masks_and_return",
+                    "masks_selected": masks_to_keep,
+                    "final_output_json": PATH_TO_LATEST_OUTPUT_JSON,
+                }
+            )
+            full_history.append(
+                {
+                    "type": "run_end",
+                    "status": "success",
+                    "total_rounds": generation_count + 1,
+                }
+            )
+            _save_full_history()
             return messages, final_outputs, rendered_final_output
 
         elif tool_call["name"] == "report_no_mask":
@@ -570,6 +668,22 @@ def agent_inference(
                     "content": [{"type": "text", "text": generated_text}],
                 }
             )
+
+            full_history.append(
+                {
+                    "type": "tool_result",
+                    "round": generation_count + 1,
+                    "tool": "report_no_mask",
+                }
+            )
+            full_history.append(
+                {
+                    "type": "run_end",
+                    "status": "success_no_mask",
+                    "total_rounds": generation_count + 1,
+                }
+            )
+            _save_full_history()
             return messages, final_outputs, rendered_final_output
 
         else:
@@ -616,12 +730,24 @@ def agent_inference(
     print("\n\n>>> SAM 3 Agent execution ended.\n\n")
 
     error_save_path = os.path.join(
-        error_save_dir,
-        f"{img_path.rsplit('/', 1)[-1].rsplit('.', 1)[0]}_error_history.json",
+        run_folder,
+        f"{image_stem}_error_history.json",
     )
     with open(error_save_path, "w") as f:
         json.dump(messages, f, indent=4)
     print("Saved messages history that caused error to:", error_save_path)
+
+    full_history.append(
+        {
+            "type": "run_end",
+            "status": "error_none_response",
+            "total_rounds": generation_count + 1,
+            "error": f"Generated text is None for image '{img_path}' with query '{initial_text_prompt}'",
+            "pruned_messages_saved_to": error_save_path,
+        }
+    )
+    _save_full_history()
+
     raise ValueError(
         rf"Generated text is None, which is unexpected. Please check the Qwen server and the input parameters for image path: {img_path} and initial text prompt: {initial_text_prompt}."
     )
