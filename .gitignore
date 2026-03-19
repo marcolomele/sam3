@@ -4,7 +4,8 @@ __pycache__/
 *$py.class
 *.env
 agent_output/
-
+data
+agent_output_vlm_exo/
 # C extensions
 *.so
 
