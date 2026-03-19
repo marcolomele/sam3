@@ -33,22 +33,28 @@ def connected_components_cpu_single(values: torch.Tensor):
 
 def connected_components_cpu(input_tensor: torch.Tensor):
     out_shape = input_tensor.shape
-    if input_tensor.dim() == 4 and input_tensor.shape[1] == 1:
-        input_tensor = input_tensor.squeeze(1)
+    orig_device = input_tensor.device
+    # Move to CPU for skimage processing (handles MPS tensors too)
+    input_tensor_cpu = input_tensor.cpu()
+    if input_tensor_cpu.dim() == 4 and input_tensor_cpu.shape[1] == 1:
+        input_tensor_cpu = input_tensor_cpu.squeeze(1)
     else:
-        assert input_tensor.dim() == 3, (
+        assert input_tensor_cpu.dim() == 3, (
             "Input tensor must be (B, H, W) or (B, 1, H, W)."
         )
 
-    batch_size = input_tensor.shape[0]
+    batch_size = input_tensor_cpu.shape[0]
+    if batch_size == 0:
+        return torch.zeros(out_shape, dtype=torch.long, device=orig_device), torch.zeros(out_shape, dtype=torch.long, device=orig_device)
+
     labels_list = []
     counts_list = []
     for b in range(batch_size):
-        labels, counts = connected_components_cpu_single(input_tensor[b])
+        labels, counts = connected_components_cpu_single(input_tensor_cpu[b])
         labels_list.append(labels)
         counts_list.append(counts)
-    labels_tensor = torch.stack(labels_list, dim=0).to(input_tensor.device)
-    counts_tensor = torch.stack(counts_list, dim=0).to(input_tensor.device)
+    labels_tensor = torch.stack(labels_list, dim=0).to(orig_device)
+    counts_tensor = torch.stack(counts_list, dim=0).to(orig_device)
     return labels_tensor.view(out_shape), counts_tensor.view(out_shape)
 
 
@@ -82,5 +88,5 @@ def connected_components(input_tensor: torch.Tensor):
 
             return connected_components_triton(input_tensor)
 
-    # CPU fallback
+    # CPU / MPS fallback — processing is done on CPU via skimage
     return connected_components_cpu(input_tensor)

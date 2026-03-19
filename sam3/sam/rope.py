@@ -75,7 +75,10 @@ def apply_rotary_enc(
     # repeat freqs along seq_len dim to match k seq_len
     if repeat_freqs_k:
         r = xk_.shape[-2] // xq_.shape[-2]
-        freqs_cis = freqs_cis.repeat(*([1] * (freqs_cis.ndim - 2)), r, 1)
+        # MPS doesn't support .repeat() on complex tensors — work via real view
+        fc_r = torch.view_as_real(freqs_cis)
+        fc_r = fc_r.repeat(*([1] * (fc_r.ndim - 3)), r, 1, 1)
+        freqs_cis = torch.view_as_complex(fc_r.contiguous())
     xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
     return xq_out.type_as(xq).to(xq.device), xk_out.type_as(xk).to(xk.device)
 

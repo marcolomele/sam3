@@ -283,13 +283,13 @@ class RoPEAttention(Attention):
         self.compute_cis = partial(
             compute_axial_cis, dim=self.internal_dim // self.num_heads, theta=rope_theta
         )
-        device = torch.device("cuda") if torch.cuda.is_available() else None
+        # Always compute on CPU — complex ops (torch.polar, .real/.imag) are safe there.
+        # The real/imag parts are moved to the target device in forward().
         self.freqs_cis = self.compute_cis(
-            end_x=feat_sizes[0], end_y=feat_sizes[1], device=device
+            end_x=feat_sizes[0], end_y=feat_sizes[1], device=None
         )
-        if self.use_rope_real:
-            self.freqs_cis_real = self.freqs_cis.real
-            self.freqs_cis_imag = self.freqs_cis.imag
+        self.freqs_cis_real = self.freqs_cis.real
+        self.freqs_cis_imag = self.freqs_cis.imag
         self.rope_k_repeat = rope_k_repeat
 
     def forward(
@@ -308,14 +308,22 @@ class RoPEAttention(Attention):
         # Apply rotary position encoding
         w = h = math.sqrt(q.shape[-2])
         if self.freqs_cis.shape[0] != q.shape[-2]:
-            self.freqs_cis = self.compute_cis(end_x=w, end_y=h, device=q.device)
+            # Recompute on CPU, then sync real/imag to target device
+            self.freqs_cis = self.compute_cis(end_x=w, end_y=h, device=None)
             self.freqs_cis_real = self.freqs_cis.real
             self.freqs_cis_imag = self.freqs_cis.imag
+        # Ensure real/imag parts are on the right device (handles CUDA and MPS)
+        if self.freqs_cis_real.device != q.device:
+            self.freqs_cis_real = self.freqs_cis_real.to(q.device)
+            self.freqs_cis_imag = self.freqs_cis_imag.to(q.device)
+        if q.device.type != "mps" and self.freqs_cis.device != q.device:
+            self.freqs_cis = self.freqs_cis.to(q.device)
         if q.shape[-2] != k.shape[-2]:
             assert self.rope_k_repeat
 
         num_k_rope = k.size(-2) - num_k_exclude_rope
-        if self.use_rope_real:
+        # Use real-valued path on MPS (view_as_complex not supported) or when requested
+        if self.use_rope_real or q.device.type == "mps":
             q, k[:, :, :num_k_rope] = apply_rotary_enc_real(
                 q,
                 k[:, :, :num_k_rope],

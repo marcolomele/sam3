@@ -39,8 +39,9 @@ class Sam3VideoPredictor:
     ):
         self.async_loading_frames = async_loading_frames
         self.video_loader_type = video_loader_type
-        from sam3.model_builder import build_sam3_video_model
+        from sam3.model_builder import _get_default_device, build_sam3_video_model
 
+        device = _get_default_device()
         self.model = (
             build_sam3_video_model(
                 checkpoint_path=checkpoint_path,
@@ -50,8 +51,8 @@ class Sam3VideoPredictor:
                 strict_state_dict_loading=strict_state_dict_loading,
                 apply_temporal_disambiguation=apply_temporal_disambiguation,
                 compile=compile,
+                device=device,
             )
-            .cuda()
             .eval()
         )
 
@@ -279,10 +280,15 @@ class Sam3VideoPredictor:
 
     def _get_torch_and_gpu_properties(self):
         """Get a string for PyTorch and GPU properties (for logging and debugging)."""
-        torch_and_gpu_str = (
-            f"torch: {torch.__version__} with CUDA arch {torch.cuda.get_arch_list()}, "
-            f"GPU device: {torch.cuda.get_device_properties(torch.cuda.current_device())}"
-        )
+        if torch.cuda.is_available():
+            torch_and_gpu_str = (
+                f"torch: {torch.__version__} with CUDA arch {torch.cuda.get_arch_list()}, "
+                f"GPU device: {torch.cuda.get_device_properties(torch.cuda.current_device())}"
+            )
+        elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            torch_and_gpu_str = f"torch: {torch.__version__}, device: MPS (Apple Silicon)"
+        else:
+            torch_and_gpu_str = f"torch: {torch.__version__}, device: CPU"
         return torch_and_gpu_str
 
     def shutdown(self):

@@ -79,7 +79,7 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
         if offload_state_to_cpu:
             inference_state["storage_device"] = torch.device("cpu")
         else:
-            inference_state["storage_device"] = torch.device("cuda")
+            inference_state["storage_device"] = self.device
 
         if video_path is not None:
             images, video_height, video_width = load_video_frames(
@@ -1022,7 +1022,7 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
                 )
             else:
                 # Cache miss -- we will run inference on a single image
-                image = inference_state["images"][frame_idx].cuda().float().unsqueeze(0)
+                image = inference_state["images"][frame_idx].to(inference_state["device"]).float().unsqueeze(0)
                 backbone_out = self.forward_image(image)
                 # Cache the most recent frame's feature (for repeated interactions with
                 # a frame; we can use an LRU cache for more frames in the future).
