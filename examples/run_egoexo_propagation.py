@@ -82,6 +82,15 @@ def parse_args():
             "Defaults to DATA_DIR if not set."
         ),
     )
+    p.add_argument(
+        "--bpe_path", default=None,
+        help=(
+            "Explicit path to bpe_simple_vocab_16e6.txt.gz. "
+            "Use this when pkg_resources resolves to the wrong location "
+            "(e.g. pip install missing assets/). "
+            "Example: /home/user/sam3/sam3/assets/bpe_simple_vocab_16e6.txt.gz"
+        ),
+    )
     return p.parse_args()
 
 
@@ -477,8 +486,11 @@ def main():
     from sam3.model_builder import build_sam3_video_model
     from sam3.model.sam3_image_processor import Sam3Processor
 
-    import pkg_resources
-    bpe_path = pkg_resources.resource_filename("sam3", "assets/bpe_simple_vocab_16e6.txt.gz")
+    bpe_path = args.bpe_path
+    if bpe_path is None:
+        import pkg_resources
+        bpe_path = pkg_resources.resource_filename("sam3", "assets/bpe_simple_vocab_16e6.txt.gz")
+    print(f"Using bpe_path: {bpe_path}")
     sam3_model = build_sam3_video_model(bpe_path=bpe_path)
     tracker = sam3_model.tracker
     tracker.backbone = sam3_model.detector.backbone
