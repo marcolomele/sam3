@@ -9,7 +9,9 @@
 #SBATCH --mail-user mark.lomele@gmail.com
 #SBATCH --mail-type END
 
-conda activate sam3_venv
+module load cuda/12.4                                                                            
+  
+source ~/.conda/envs/sam3_venv/bin/activate  
 
 python examples/run_egoexo_propagation.py \
     --data_dir ../data/video_datasets/3321908/output_dir_all \
