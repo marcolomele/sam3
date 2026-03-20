@@ -220,15 +220,17 @@ def process_take(take_uid, object_name, text_prompt, data_dir, out_root,
     empty_mask = np.zeros((H, W), dtype=bool)
 
     # ── Load all frames + GT masks ─────────────────────────────────────────
-    print(f"  Loading frames and GT masks...")
+    print(f"  Loading {len(frame_nums)} frames and GT masks...")
     frames_rgb = {}
     gt_masks   = {}
-    for fstr, fn in zip(selected_frame_strs, frame_nums):
+    for i, (fstr, fn) in enumerate(zip(selected_frame_strs, frame_nums)):
         img_path = os.path.join(data_dir, take_uid, selected_cam, f"{fstr}.jpg")
         frames_rgb[fn] = np.array(Image.open(img_path).convert("RGB"))
         gt_masks[fn] = decode_mask(
             masks_by_obj[selected_obj][selected_cam][fstr], H, W
         )
+        if (i + 1) % 100 == 0 or (i + 1) == len(frame_nums):
+            print(f"    loaded {i+1}/{len(frame_nums)} frames")
 
     # ── Select reference frame: largest GT mask ────────────────────────────
     ref_fn = max(frame_nums, key=lambda fn: gt_masks[fn].sum())
@@ -258,19 +260,20 @@ def process_take(take_uid, object_name, text_prompt, data_dir, out_root,
     plt.close(fig)
 
     # ── Copy frames to temp video dir for SAM 3 tracker ───────────────────
+    n_frames = len(frame_nums)
+    print(f"  Copying {n_frames} frames to temp dir...")
     tmp_video_dir = tempfile.mkdtemp(prefix="sam3_egoexo_")
     try:
         for seq_idx, fstr in enumerate(selected_frame_strs):
             src = os.path.join(data_dir, take_uid, selected_cam, f"{fstr}.jpg")
             dst = os.path.join(tmp_video_dir, f"{seq_idx:05d}.jpg")
             shutil.copy(src, dst)
+        print(f"  Temp dir ready: {tmp_video_dir}")
 
         mask_tensor = torch.tensor(ref_gt_mask.astype(np.float32))
-        n_frames    = len(frame_nums)
 
         # ── Method 1: SAM 3 bi-directional propagation ────────────────────
-        print("  Running SAM 3 propagation...")
-
+        print(f"  [1/2] SAM 3 propagation — forward ({n_frames - ref_seq_idx} frames)...")
         inf_state_fwd = tracker.init_state(video_path=tmp_video_dir)
         tracker.add_new_mask(
             inference_state=inf_state_fwd,
@@ -280,7 +283,9 @@ def process_take(take_uid, object_name, text_prompt, data_dir, out_root,
             tracker, inf_state_fwd, ref_seq_idx, reverse=False,
             n_frames=n_frames,
         )
+        print(f"    forward done — {len(sam3_masks_fwd)} frames propagated")
 
+        print(f"  [1/2] SAM 3 propagation — backward ({ref_seq_idx} frames)...")
         inf_state_bwd = tracker.init_state(video_path=tmp_video_dir)
         tracker.add_new_mask(
             inference_state=inf_state_bwd,
@@ -290,6 +295,7 @@ def process_take(take_uid, object_name, text_prompt, data_dir, out_root,
             tracker, inf_state_bwd, ref_seq_idx, reverse=True,
             n_frames=n_frames,
         )
+        print(f"    backward done — {len(sam3_masks_bwd)} frames propagated")
 
         sam3_pred_masks = {
             i: (sam3_masks_bwd if i < ref_seq_idx else sam3_masks_fwd).get(
@@ -298,14 +304,17 @@ def process_take(take_uid, object_name, text_prompt, data_dir, out_root,
             for i in range(n_frames)
         }
         del inf_state_fwd, inf_state_bwd
+        print(f"  SAM 3 propagation complete — {len(sam3_pred_masks)} total frames")
 
     finally:
         shutil.rmtree(tmp_video_dir, ignore_errors=True)
+        print(f"  Temp dir removed")
 
     # ── Method 2: One-shot SAM 3 + centroid heuristic ─────────────────────
-    print("  Running one-shot SAM 3 + centroid heuristic...")
+    print(f"  [2/2] One-shot SAM 3 + centroid heuristic — {n_frames} frames...")
     ref_centroid = mask_centroid(ref_gt_mask)
     naive_pred_masks = {}
+    naive_no_candidate = 0
 
     for seq_idx, (fstr, fn) in enumerate(zip(selected_frame_strs, frame_nums)):
         img_pil = Image.open(
@@ -320,6 +329,7 @@ def process_take(take_uid, object_name, text_prompt, data_dir, out_root,
 
         if candidate_masks is None or candidate_masks.shape[0] == 0:
             naive_pred_masks[seq_idx] = empty_mask
+            naive_no_candidate += 1
             continue
 
         best_mask = None
@@ -338,6 +348,11 @@ def process_take(take_uid, object_name, text_prompt, data_dir, out_root,
 
         naive_pred_masks[seq_idx] = best_mask if best_mask is not None else empty_mask
 
+        if (seq_idx + 1) % 50 == 0 or (seq_idx + 1) == n_frames:
+            print(f"    frame {seq_idx+1}/{n_frames}  |  no-candidate so far: {naive_no_candidate}")
+
+    print(f"  One-shot heuristic complete — {naive_no_candidate}/{n_frames} frames had no candidates")
+
     # ── IoU computation ────────────────────────────────────────────────────
     print("  Computing IoU...")
     sam3_iou_per_frame  = {}
@@ -354,6 +369,7 @@ def process_take(take_uid, object_name, text_prompt, data_dir, out_root,
     print(f"  Naive mean IoU  : {naive_mean_iou:.4f}")
 
     # ── Plot 1: IoU across frames ──────────────────────────────────────────
+    print("  Saving IoU plot...")
     fig, ax = plt.subplots(figsize=(12, 3))
     xs = list(range(len(frame_nums)))
     ax.plot(xs, [sam3_iou_per_frame[fn] for fn in frame_nums],
@@ -415,7 +431,7 @@ def process_take(take_uid, object_name, text_prompt, data_dir, out_root,
         plt.close(fig)
 
     # ── Save masks as .npz ─────────────────────────────────────────────────
-    print("  Saving masks (.npz)...")
+    print("  Saving masks (.npz)...  gt / sam3 / naive")
     np.savez_compressed(
         os.path.join(out_dir, "gt_masks.npz"),
         **{str(i): gt_masks[fn] for i, fn in enumerate(frame_nums)},
