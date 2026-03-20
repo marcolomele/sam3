@@ -1,0 +1,36 @@
+# Minimal requirements to run run_egoexo_propagation.py on a Linux GPU server.
+#
+# STEP 1 — Install PyTorch with the right CUDA version FIRST (before this file):
+#   CUDA 12.1:  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+#   CUDA 11.8:  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+#   CUDA 12.4:  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+#
+# STEP 2 — Then install this file:
+#   pip install -r requirements_linux.txt
+
+# ── sam3 declared dependencies (pyproject.toml) ────────────────────────────
+sam3
+timm>=1.0.17
+numpy>=1.26,<2
+tqdm
+ftfy==6.1.1
+regex
+iopath>=0.1.10
+typing_extensions
+huggingface_hub
+
+# ── sam3 runtime imports (found in model_builder + sam3_image_processor) ───
+einops            # tensor ops used throughout sam3 model internals
+scipy             # spatial matching / assignment in tracker
+scikit-image      # image utilities used in sam3 preprocessing
+opencv-python     # cv2, used in sam3 video frame I/O
+psutil            # memory/process checks in multi-GPU code
+
+# ── script direct imports ───────────────────────────────────────────────────
+pillow
+matplotlib
+pycocotools
+
+# ── optional but avoids import errors on some sam3 paths ───────────────────
+# eva-decord is a fork; install the PyPI name:
+eva-decord        # video decoding used in sam3 data utilities (may error without it)
