@@ -3,12 +3,13 @@
 SAM 3 Video Propagation vs. Naive Heuristic — EgoExo4D Batch Runner
 ====================================================================
 Runs the full SAM 3 bi-directional propagation + one-shot centroid pipeline
-for each supplied take UID, automatically selecting:
-  - Object : first object with >= MIN_FRAMES annotated frames on the ego camera
-  - Camera : first camera whose name contains "aria" (ego view)
-  - Reference frame : frame with the LARGEST GT mask (most salient)
+for a user-specified list of (take, object, text prompt) triples.
 
-Outputs per take (saved to {DATA_DIR}/{uid[:5]}_results/):
+Per-take behaviour:
+  - Camera      : first camera containing "aria" in its name (ego view)
+  - Reference   : frame with the LARGEST GT mask for the given object
+
+Outputs per take (saved to {out_root}/{uid[:5]}_results/):
   0_salient_frame.jpeg            — reference frame + GT mask
   0_iou_across_frames.jpeg        — per-frame IoU curve for both methods
   side_by_side_frame_{n}.jpeg     — overlay panels for every VIS_STRIDE-th frame
@@ -16,18 +17,18 @@ Outputs per take (saved to {DATA_DIR}/{uid[:5]}_results/):
   sam3_masks.npz                  — SAM 3 propagated masks      {seq_idx: mask}
   naive_masks.npz                 — heuristic propagated masks  {seq_idx: mask}
 
+Input CSV format (--input_csv):
+  take_uid,object_name,text_prompt
+  8acb2112-...,black saucepan _0,kitchen utensil
+  3f7d9a01-...,basketball,ball
+
 Usage (SLURM-friendly):
   python run_egoexo_propagation.py \\
       --data_dir /path/to/data \\
-      --take_uids uid1 uid2 uid3 \\
-      [--min_frames 300] \\
+      --input_csv takes.csv \\
       [--vis_stride 50] \\
-      [--text_prompt "object"] \\
       [--confidence_threshold 0.3] \\
       [--out_root /path/to/output_root]
-
-  Or pipe UIDs via stdin (one per line):
-      cat take_uids.txt | python run_egoexo_propagation.py --data_dir /path/to/data
 """
 
 import argparse
@@ -60,20 +61,15 @@ def parse_args():
         help="Root directory containing one sub-folder per take UID.",
     )
     p.add_argument(
-        "--take_uids", nargs="*", default=None,
-        help="List of take UIDs to process. If omitted, reads from stdin.",
-    )
-    p.add_argument(
-        "--min_frames", type=int, default=300,
-        help="Minimum annotated frames required to select an object (default 300).",
+        "--input_csv", required=True,
+        help=(
+            "CSV file with columns: take_uid,object_name,text_prompt. "
+            "One row per take to process."
+        ),
     )
     p.add_argument(
         "--vis_stride", type=int, default=50,
         help="Save a side-by-side overlay every N frames (default 50).",
-    )
-    p.add_argument(
-        "--text_prompt", default="object",
-        help="Text prompt for the one-shot SAM 3 + centroid heuristic.",
     )
     p.add_argument(
         "--confidence_threshold", type=float, default=0.3,
@@ -159,11 +155,13 @@ def collect_propagation_masks(tracker, inf_state, start_frame_idx, reverse, n_fr
 # Per-take processing
 # ---------------------------------------------------------------------------
 
-def process_take(take_uid, data_dir, out_root, min_frames, vis_stride,
-                 text_prompt, confidence_threshold, tracker, image_processor,
+def process_take(take_uid, object_name, text_prompt, data_dir, out_root,
+                 vis_stride, confidence_threshold, tracker, image_processor,
                  device):
     print(f"\n{'='*70}")
-    print(f"  Take: {take_uid}")
+    print(f"  Take  : {take_uid}")
+    print(f"  Object: {object_name}")
+    print(f"  Prompt: {text_prompt}")
     print(f"{'='*70}")
 
     # ── Load annotation ────────────────────────────────────────────────────
@@ -176,33 +174,34 @@ def process_take(take_uid, data_dir, out_root, min_frames, vis_stride,
         ann = json.load(f)
     masks_by_obj = ann["masks"]  # {object: {camera: {frame_str: rle}}}
 
-    # ── Select object & camera ─────────────────────────────────────────────
-    selected_obj = None
-    selected_cam = None
-    selected_frame_strs = None
-
-    for obj, cam_dict in sorted(masks_by_obj.items()):
-        for cam, frame_dict in cam_dict.items():
-            if "aria" not in cam.lower():
-                continue
-            if len(frame_dict) >= min_frames:
-                selected_obj = obj
-                selected_cam = cam
-                selected_frame_strs = sorted(frame_dict.keys(), key=int)
-                break
-        if selected_obj is not None:
-            break
-
-    if selected_obj is None:
+    # ── Validate object ────────────────────────────────────────────────────
+    if object_name not in masks_by_obj:
         print(
-            f"  [SKIP] No object with >= {min_frames} frames on an aria "
-            f"camera found in take {take_uid}"
+            f"  [SKIP] Object \"{object_name}\" not found in annotation. "
+            f"Available: {list(masks_by_obj.keys())}"
         )
         return
 
+    # ── Select aria camera ─────────────────────────────────────────────────
+    selected_cam = None
+    selected_frame_strs = None
+    for cam, frame_dict in masks_by_obj[object_name].items():
+        if "aria" in cam.lower():
+            selected_cam = cam
+            selected_frame_strs = sorted(frame_dict.keys(), key=int)
+            break
+
+    if selected_cam is None:
+        print(
+            f"  [SKIP] No aria camera found for object \"{object_name}\" "
+            f"in take {take_uid}. Available cameras: "
+            f"{list(masks_by_obj[object_name].keys())}"
+        )
+        return
+
+    selected_obj = object_name
     frame_nums = [int(f) for f in selected_frame_strs]
-    print(f"  Object : {selected_obj}")
-    print(f"  Camera : {selected_cam}  |  {len(frame_nums)} annotated frames")
+    print(f"  Camera: {selected_cam}  |  {len(frame_nums)} annotated frames")
 
     # ── Determine image size ───────────────────────────────────────────────
     img0_path = os.path.join(data_dir, take_uid, selected_cam,
@@ -436,17 +435,24 @@ def process_take(take_uid, data_dir, out_root, min_frames, vis_stride,
 def main():
     args = parse_args()
 
-    # Collect take UIDs: CLI args take priority, otherwise stdin
-    if args.take_uids:
-        take_uids = args.take_uids
-    else:
-        print("Reading take UIDs from stdin (one per line)...")
-        take_uids = [line.strip() for line in sys.stdin if line.strip()]
+    # ── Load input CSV ─────────────────────────────────────────────────────
+    # Expected columns: take_uid, object_name, text_prompt
+    import csv
+    takes = []
+    with open(args.input_csv, newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            takes.append((
+                row["take_uid"].strip(),
+                row["object_name"].strip(),
+                row["text_prompt"].strip(),
+            ))
 
-    if not take_uids:
-        print("No take UIDs provided. Exiting.")
+    if not takes:
+        print("No rows found in input CSV. Exiting.")
         sys.exit(1)
 
+    print(f"Loaded {len(takes)} take(s) from {args.input_csv}")
     out_root = args.out_root if args.out_root else args.data_dir
 
     # ── Device ────────────────────────────────────────────────────────────
@@ -483,29 +489,29 @@ def main():
 
     # ── Process each take ─────────────────────────────────────────────────
     errors = []
-    for uid in take_uids:
+    for take_uid, object_name, text_prompt in takes:
         try:
             process_take(
-                take_uid=uid,
+                take_uid=take_uid,
+                object_name=object_name,
+                text_prompt=text_prompt,
                 data_dir=args.data_dir,
                 out_root=out_root,
-                min_frames=args.min_frames,
                 vis_stride=args.vis_stride,
-                text_prompt=args.text_prompt,
                 confidence_threshold=args.confidence_threshold,
                 tracker=tracker,
                 image_processor=image_processor,
                 device=device,
             )
         except Exception as exc:
-            print(f"\n  [ERROR] Take {uid} failed: {exc}")
+            print(f"\n  [ERROR] Take {take_uid} failed: {exc}")
             import traceback
             traceback.print_exc()
-            errors.append((uid, str(exc)))
+            errors.append((take_uid, str(exc)))
 
     # ── Summary ───────────────────────────────────────────────────────────
     print(f"\n{'='*70}")
-    print(f"  Processed {len(take_uids) - len(errors)}/{len(take_uids)} takes successfully.")
+    print(f"  Processed {len(takes) - len(errors)}/{len(takes)} takes successfully.")
     if errors:
         print("  Failed takes:")
         for uid, msg in errors:
