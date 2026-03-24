@@ -1,0 +1,89 @@
+---
+Running Jupyter Notebook on Bocconi HPC from your laptop
+
+Prerequisites (one-time setup — already done)
+
+- Jupyter Notebook 7.5 is now installed in sam3_venv
+- SLURM job script saved at ~/jupyter_gpu.slurm
+
+---
+Step 1 — Connect to the HPC login node
+
+On your laptop, connect to the university VPN, then:
+
+ssh 3152128@lnode01.hpc.unibocconi.it
+
+---
+Step 2 — Submit the Jupyter GPU job
+
+sbatch ~/jupyter_gpu.slurm
+
+You'll get back a job ID, e.g. Submitted batch job 469500. The job requests:
+- 1 GPU (GA100), 4 CPUs, 32 GB RAM
+- 8 hours on the gpu partition
+
+---
+Step 3 — Wait for the job to start, then read connection info
+
+# Check job status (wait until STATE = R)
+squeue -u 3152128
+
+# Once running, read the connection info
+cat ~/slogs/jupyter_session.txt
+
+Output will look like:
+Node    : gnode01
+Port    : 54321
+SSH tunnel command (run on your laptop):
+    ssh -N -L 54321:gnode01:54321 3152128@lnode01.hpc.unibocconi.it
+
+The authentication token appears in the job log:
+cat ~/slogs/jupyter_<JOBID>.out | grep token
+
+---
+Step 4 — Open an SSH tunnel from your laptop
+
+Open a new terminal on your laptop (keep the VPN active) and run the tunnel command from Step 3:
+
+ssh -N -L 54321:gnode01:54321 3152128@lnode01.hpc.unibocconi.it
+
+This forwards localhost:54321 on your laptop → through the login node → to Jupyter on the GPU node. Leave this
+terminal open.
+
+---
+Step 5 — Open Jupyter in your browser
+
+Navigate to:
+http://localhost:54321
+
+Paste the token when prompted. You now have a Jupyter Notebook running on a GA100 GPU, accessible from your local
+browser.
+
+---
+Stopping the session
+
+# From the login node:
+scancel <JOBID>
+
+# Or just shut down Jupyter from the browser's File > Shut Down
+
+---
+Customizing the job
+
+Edit ~/jupyter_gpu.slurm to change:
+
+┌────────────────┬────────────────────┬──────────────────────────────────────────────┐
+│      Line      │       Option       │                   Example                    │
+├────────────────┼────────────────────┼──────────────────────────────────────────────┤
+│ --time         │ Max wall time      │ 04:00:00                                     │
+├────────────────┼────────────────────┼──────────────────────────────────────────────┤
+│ --mem          │ RAM                │ 64G                                          │
+├────────────────┼────────────────────┼──────────────────────────────────────────────┤
+│ --gres         │ Number of GPUs     │ gpu:2                                        │
+├────────────────┼────────────────────┼──────────────────────────────────────────────┤
+│ --partition    │ Queue              │ medium_gpu (3h limit) or long_gpu (3d limit) │
+├────────────────┼────────────────────┼──────────────────────────────────────────────┤
+│ --notebook-dir │ Starting directory │ /home/3152128/sam3                           │
+└────────────────┴────────────────────┴──────────────────────────────────────────────┘
+
+---
