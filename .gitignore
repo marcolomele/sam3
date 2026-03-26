@@ -7,6 +7,7 @@ __pycache__/
 agent_output/
 data
 agent_output_vlm_exo/
+*.pth
 # C extensions
 *.so
 

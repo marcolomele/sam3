@@ -1,0 +1,198 @@
+NOTEBOOK REQUIREMENTS
+=====================
+File: sam3_crop_reference_test.ipynb
+Purpose: Test SAM3 with image crop (from source mask) as an additional reference input alongside text prompts, covering both SAM3 Agent inference and Propagation.
+
+
+BACKGROUND
+----------
+SAM3 currently accepts text prompts to guide segmentation. SAM3 also supports reference image crops as positive examples. The hypothesis is that providing a crop of the annotated source object (derived from the source GT mask) alongside the text prompt will improve segmentation quality — particularly on destination frames where the object appears from a different viewpoint (ego↔exo).
+
+Source masks already exist at every annotated frame in the dataset. The notebook validates whether feeding those crops into SAM3 (at both Agent and Propagation stages) measurably helps, using random takes and objects from the dataset, with user-provided text prompts per object.
+
+
+DATASET
+-------
+Root: /data/video_datasets/3321908/output_dir_all/
+Layout: {root}/{take_uid}/{camera}/{frame}.jpg  (flat JPEG files in camera folder)
+Annotations: {root}/{take_uid}/annotation.json
+Image sizes: 448×448 (aria/egocentric), 796×448 (exo cameras)
+GT mask resolution: stored at 1408×1408 in annotation.json; always resize to image size before use.
+Cameras: one aria camera (ego) and one or more exo cameras per take.
+Annotated frames: every ~30 frames (not every frame).
+
+annotation.json structure (relevant fields):
+  - object_name: name of the annotated object in the take
+  - aria_camera_name: name of the ego camera
+  - object_annotations: dict keyed by frame_number (str) →
+      {camera_name → {"mask": <RLE dict compatible with pycocotools>}}
+
+
+NOTEBOOK STRUCTURE — CELL BY CELL
+-----------------------------------
+
+### Cell 1 — Imports and Device Setup
+Imports: torch, numpy, json, os, random, matplotlib, PIL, pycocotools, sam3 modules.
+Set device (mps / cuda / cpu with auto-detection).
+Set torch.autocast and torch.inference_mode context.
+Style: mirror sam3_agent.ipynb setup cell.
+
+### Cell 2 — Configuration (user edits this cell)
+CONFIG dict with:
+  - data_root: path to dataset root
+  - n_takes: how many takes to randomly sample (default 3)
+  - n_frames_per_take: how many source frames to test per take (default 5, selected randomly from annotated frames)
+  - crop_padding_ratio: fractional padding around the GT mask bbox when cropping (default 0.15)
+  - confidence_threshold: SAM3 confidence threshold (default 0.5)
+  - device: "mps" / "cuda" / "cpu"
+  - seed: random seed for reproducibility (default 42)
+
+### Cell 3 — Dataset Exploration Helper Functions
+Functions:
+  - list_takes(data_root) → list of take_uid strings
+  - load_annotation(take_path) → parsed annotation.json dict
+  - get_annotated_frames(annotation, camera) → sorted list of annotated frame numbers (int)
+  - load_frame(take_path, camera, frame_num) → PIL.Image (RGB)
+  - decode_mask(rle, H, W) → np.bool_ array at (H, W) using pycocotools, resizing to (H,W) with Image.NEAREST
+  - mask_to_bbox(mask) → (x1, y1, x2, y2) tight bounding box of the True region
+  - crop_from_mask(image_pil, mask, padding_ratio) → PIL.Image crop of the object bbox with padding, maintaining aspect ratio; also return the bbox used
+
+### Cell 4 — Random Take and Frame Selection
+Using CONFIG seed, randomly sample n_takes takes from list_takes().
+For each take, load annotation.json and extract:
+  - object_name
+  - aria camera name (ego source)
+  - one exo camera name (destination; pick the first exo camera present)
+  - list of annotated frame numbers available in both source and destination cameras
+Randomly sample n_frames_per_take frame numbers per take from the intersection of annotated frames.
+Print a summary table: take_uid | object_name | source_camera | dest_camera | n_frames_available | selected_frames
+
+### Cell 5 — User Text Prompt Input (interactive)
+Display each selected take's object_name and a representative source frame thumbnail.
+Provide a text input widget (ipywidgets.Textarea or simple dict assignment) where the user types a text prompt per object.
+Store prompts in: prompts = {take_uid: "user prompt string"}
+Instruction comment: "Enter a descriptive text prompt for each object. This will be passed to SAM3 alongside the image crop."
+Fallback: if no widget available, user edits a PROMPTS dict directly in the cell.
+
+### Cell 6 — SAM3 Model Loading
+Load the image model for Agent inference:
+  from sam3 import build_sam3_image_model
+  from sam3.model.sam3_image_processor import Sam3Processor
+  sam3_root = os.path.dirname(sam3.__file__)
+  bpe_path = f"{sam3_root}/assets/bpe_simple_vocab_16e6.txt.gz"
+  image_model = build_sam3_image_model(bpe_path=bpe_path, device=CONFIG["device"])
+  processor = Sam3Processor(image_model, confidence_threshold=CONFIG["confidence_threshold"], device=CONFIG["device"])
+
+Load the video model for Propagation:
+  from sam3.model_builder import build_sam3_video_model
+  video_model = build_sam3_video_model()
+  tracker = video_model.tracker
+  tracker.backbone = video_model.detector.backbone
+
+### Cell 7 — Core Helper: Run SAM3 Agent (text-only baseline)
+Function: run_agent_text_only(processor, dest_frame_pil, text_prompt) → predicted_mask (np.bool_ H×W or None)
+  - Calls the SAM3 image processor/agent with only the text prompt.
+  - Returns the highest-confidence mask, or None if no mask passes threshold.
+
+### Cell 8 — Core Helper: Run SAM3 Agent (text + crop reference)
+Function: run_agent_text_plus_crop(processor, dest_frame_pil, text_prompt, crop_pil) → predicted_mask (np.bool_ H×W or None)
+  - Calls the SAM3 image processor/agent with BOTH the text prompt AND the crop_pil as a reference image (positive example).
+  - Document here the specific SAM3 API parameter used to pass the reference crop (investigate Sam3Processor signature; likely an `reference_images` or `exemplar` parameter).
+  - Returns the highest-confidence mask, or None.
+  NOTE: if the API does not directly accept a reference image in this call signature, document the alternative approach found (e.g., embedding the crop separately and injecting it into the model's visual memory before calling the processor).
+
+### Cell 9 — Core Helper: Run SAM3 Propagation (mask-only baseline)
+Function: run_propagation_mask_only(tracker, video_frames_pil, seed_frame_idx, seed_mask) → dict {frame_idx: np.bool_ mask}
+  - Initializes tracker state from video_frames_pil (list of PIL images written to a temp dir).
+  - Seeds with seed_mask at seed_frame_idx using tracker.add_new_mask().
+  - Runs tracker.propagate_in_video() forward only.
+  - Returns dict mapping frame index to predicted mask.
+
+### Cell 10 — Core Helper: Run SAM3 Propagation (mask + crop reference)
+Function: run_propagation_mask_plus_crop(tracker, video_frames_pil, seed_frame_idx, seed_mask, crop_pil) → dict {frame_idx: np.bool_ mask}
+  - Same as Cell 9 but ALSO provides crop_pil as an additional reference (exemplar) to the tracker.
+  - Document the SAM3 tracker API for passing reference crops (investigate tracker.add_new_points_or_box or equivalent; or whether there is an add_new_reference_image method).
+  - If the API requires a different approach (e.g., initialize the tracker's memory with the crop first), document and implement that.
+
+### Cell 11 — IoU Computation Helper
+Function: compute_iou(pred_mask, gt_mask) → float in [0, 1]
+  - Pixel-level IoU. Returns 0.0 if both masks are empty.
+  - Auto-resize pred to gt shape if needed (use Image.NEAREST).
+
+### Cell 12 — Visualization Helper
+Function: render_comparison(source_frame_pil, crop_pil, dest_frame_pil, gt_mask, results_dict) → matplotlib Figure
+  - results_dict: {"text_only": mask_or_None, "text_plus_crop": mask_or_None}
+  - Layout: 1 row, 4 columns:
+      Col 1: Source frame with GT mask overlaid (green), title "Source + GT Mask"
+      Col 2: Extracted crop (the reference image fed to SAM3), title "Reference Crop"
+      Col 3: Destination frame with text-only prediction (red=pred, green=gt, yellow=overlap), title f"Text-only IoU={iou:.3f}"
+      Col 4: Destination frame with text+crop prediction overlay, title f"Text+Crop IoU={iou:.3f}"
+  - Show GT mask contour on destination columns for reference.
+  - If a prediction is None, show the destination frame with "No detection" label.
+  - Color scheme: mirror render_overlay() in sam3_propagation_comparison.ipynb (pred=red, gt=green, overlap=yellow, alpha=0.4).
+
+### Cell 13 — Main Experiment Loop: SAM3 Agent
+For each take, for each selected frame:
+  a. Load source frame (ego/aria) and GT source mask.
+  b. Compute crop from source frame using source mask + padding.
+  c. Load destination frame (exo).
+  d. Load GT destination mask (same frame number, exo camera).
+  e. Run run_agent_text_only() → pred_text.
+  f. Run run_agent_text_plus_crop() → pred_crop.
+  g. Compute IoU for both vs GT destination mask.
+  h. Append row to results list: {take_uid, frame_num, object_name, method, iou, detection (bool)}.
+  i. Call render_comparison() and display the figure inline (plt.show()).
+  j. Print per-frame summary line: "Take X | Frame Y | text_only IoU=0.XXX | text+crop IoU=0.XXX"
+Collect all results into a pandas DataFrame.
+
+### Cell 14 — Main Experiment Loop: SAM3 Propagation
+For each take:
+  a. Pick the earliest selected frame as the seed frame.
+  b. Load source seed frame and GT source mask → extract crop.
+  c. Load all frames of the exo camera between the seed frame and the last selected frame (this forms the video clip for propagation).
+  d. Run run_propagation_mask_only(): seed with GT destination mask at seed frame → propagate forward → collect masks at selected frame numbers.
+  e. Run run_propagation_mask_plus_crop(): same seed mask AND crop reference → propagate forward → collect masks at selected frame numbers.
+  f. For each selected frame: compute IoU for both methods vs GT destination mask, display overlay.
+  g. Plot a per-frame IoU curve (x=frame number, y=IoU) with two lines: "mask-only" and "mask+crop", on the same axis.
+  h. Append results to same DataFrame schema.
+
+### Cell 15 — Aggregate Results Summary
+Group DataFrame by method, compute:
+  - detection_rate: fraction of frames where IoU > 0
+  - mean_iou_all: mean IoU across all frames (including zeros)
+  - mean_iou_positive: mean IoU among detected frames only (IoU > 0)
+  - iou_gt_50pct: fraction with IoU > 0.5
+Print a results table with columns: method | detection_rate | mean_iou_all | mean_iou_positive | iou_gt_50pct
+Print a qualitative interpretation: what the numbers suggest about whether crop reference helps.
+
+### Cell 16 — API Discovery Notes (Markdown cell)
+Markdown cell documenting:
+  - The exact SAM3 API parameters used to pass reference crops (both for image model and video tracker).
+  - Any limitations discovered (e.g., only one reference crop accepted, crops must be a specific resolution).
+  - Observations: does the crop input improve detection rate? Does it improve IoU quality?
+  - Recommendations for how to integrate this into experiment.py if the approach is promising.
+
+
+STYLE GUIDELINES
+----------------
+- Mirror the code style of sam3_agent.ipynb and sam3_propagation_comparison.ipynb.
+- Each major section starts with a Markdown cell header (##) explaining what the section does and why.
+- Helper functions have docstrings with Args/Returns.
+- Use matplotlib with a consistent figure size (14 wide for comparison grids).
+- Suppress verbose model loading output where possible (use contextlib.redirect_stdout or assign to _).
+- No external API calls (no Ollama, no HuggingFace inference API) — all inference is local.
+- All random selection is seeded via CONFIG["seed"] for reproducibility.
+- The notebook must be runnable top-to-bottom without edits except Cell 5 (prompts) and Cell 2 (config).
+
+
+KEY OPEN QUESTION FOR IMPLEMENTATION
+--------------------------------------
+The core engineering unknown is: what is the exact SAM3 API to pass a reference image crop as a positive example input?
+
+Investigate in this order:
+1. Inspect Sam3Processor.__init__ and Sam3Processor.__call__ signatures for reference/exemplar/crop parameters.
+2. Inspect the sam3_agent's run_single_image_inference() for any reference image support.
+3. Check sam3/model/sam3_image_model.py or equivalent for a forward() method accepting reference images.
+4. Check the video tracker (tracker.add_new_points_or_box, tracker.add_new_mask) for any crop/exemplar argument.
+5. If no direct API exists, fall back to: encode the crop separately through the image encoder, then inject the resulting embedding as a visual memory token before running the main forward pass.
+Document whichever approach works in Cell 16.
