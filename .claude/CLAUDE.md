@@ -64,12 +64,29 @@ Each team member has their own username (3164542 = Giovanni, others differ). Alw
 
 **Data layout**: `root/{take_uid}/{camera}/{frame}.jpg` — flat JPEGs directly in camera folder (not nested under object_name/rgb/)
 
-**Image sizes**: 448×448 (aria/egocentric), 796×448 (exo) — heavily downsampled from original EgoExo4D 1404×1404
+**Image sizes by dataset folder:**
 
-**GT mask resolution**: masks in annotation.json are stored at 1408×1408 (original resolution). Always resize to image size before indexing:
+| Folder | Aria (ego) | Exo (cam/gp) | Notes |
+|--------|-----------|--------------|-------|
+| `output_dir_all` (downscaled) | 448×448 | 796×448 (W×H) | non-integer scale factors vs annotation |
+| `normal_takes_subset_processed` | 704×704 | 960×540 (W×H) | exact 2× / 4× scale vs annotation |
+
+`/data` is a symlink to `/mnt/beegfsnew/data`.
+
+**GT mask resolution**: annotation.json RLE masks differ by camera type — always resize to image size before use:
+
+| Camera type | RLE stored size (H×W) | Image size (H×W) downscaled | Image size (H×W) normal | Scale factor |
+|-------------|----------------------|-----------------------------|-------------------------|--------------|
+| aria | 1408×1408 | 448×448 | 704×704 | ÷3.14 / ÷2 (exact) |
+| exo landscape (cam*, gp01, etc.) | 2160×3840 | 448×796 | 540×960 | ÷4.82 / ÷4 (exact) |
+| exo portrait (gp02) | 3840×2160 | 796×448 | — | ÷4.82 |
+
+`gp02` cameras are physically portrait-mounted — both the images and RLEs are in portrait orientation (H > W). The direct `cv2.resize` in the pipeline handles these correctly; no rotation is needed.
+
+Resize snippet (use `cv2.INTER_NEAREST` for binary masks):
 ```python
 if mask.shape != (H, W):
-    mask = np.array(Image.fromarray(mask).resize((W, H), Image.NEAREST)).astype(bool)
+    mask = cv2.resize(mask.astype(np.uint8), (W, H), interpolation=cv2.INTER_NEAREST).astype(bool)
 ```
 
 **Baseline**: 50 balanced takes, 10 per scenario (basketball, bike repair, cooking, health, music)

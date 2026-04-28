@@ -105,6 +105,8 @@ def agent_inference(
     call_sam_service=call_sam_service,
     max_generations: int = 100,
     output_dir="../../sam3_agent_out",
+    pr_filter_fn=None,
+    pr_top_k: int = 3,
 ):
     """
     Given a text prompt and an image, this tool will perform all aspects of agentic problem solving,
@@ -146,6 +148,12 @@ def agent_inference(
     USED_TEXT_PROMPTS = (
         set()
     )  # Track all previously used text prompts for segment_phrase
+    # Guard against deterministic fixed-point loops where the MLLM repeatedly
+    # proposes the same already-rejected prompt. Abort the run after
+    # CONSECUTIVE_REJECTION_LIMIT same-prompt rejections in a row.
+    LAST_REJECTED_PROMPT = None
+    CONSECUTIVE_REJECTION_COUNT = 0
+    CONSECUTIVE_REJECTION_LIMIT = 3
     generation_count = 0  # Counter for number of send_generate_request calls
 
     # full_history: the complete, unpruned record of every event in this run.
@@ -154,7 +162,7 @@ def agent_inference(
     full_history_path = os.path.join(run_folder, "full_history.json")
 
     def _save_full_history():
-        with open(full_history_path, "w") as f:
+        with open(full_history_path, "w", encoding="utf-8") as f:
             json.dump(full_history, f, indent=2)
 
     # record run metadata as first entry
@@ -170,9 +178,9 @@ def agent_inference(
     _save_full_history()
 
     # The helper functions are now defined outside the agent_inference function
-    with open(MLLM_SYSTEM_PROMPT_PATH, "r") as f:
+    with open(MLLM_SYSTEM_PROMPT_PATH, "r", encoding="utf-8") as f:
         system_prompt = f.read().strip()
-    with open(ITERATIVE_CHECKING_SYSTEM_PROMPT_PATH, "r") as f:
+    with open(ITERATIVE_CHECKING_SYSTEM_PROMPT_PATH, "r", encoding="utf-8") as f:
         iterative_checking_system_prompt = f.read().strip()
 
     # Construct the initial message list
@@ -301,10 +309,58 @@ def agent_inference(
             # Check if this text_prompt has been used before
             current_text_prompt = tool_call["parameters"]["text_prompt"]
             if current_text_prompt in USED_TEXT_PROMPTS:
+                if current_text_prompt == LAST_REJECTED_PROMPT:
+                    CONSECUTIVE_REJECTION_COUNT += 1
+                else:
+                    LAST_REJECTED_PROMPT = current_text_prompt
+                    CONSECUTIVE_REJECTION_COUNT = 1
+
+                if CONSECUTIVE_REJECTION_COUNT >= CONSECUTIVE_REJECTION_LIMIT:
+                    print(
+                        f"❌ Prompt '{current_text_prompt}' rejected {CONSECUTIVE_REJECTION_COUNT} "
+                        f"times in a row — aborting agent run with empty masks."
+                    )
+                    height, width = cv2.imread(img_path).shape[:2]
+                    final_outputs = {
+                        "original_image_path": img_path,
+                        "orig_img_h": height,
+                        "orig_img_w": width,
+                        "pred_boxes": [],
+                        "pred_scores": [],
+                        "pred_masks": [],
+                    }
+                    rendered_final_output = Image.open(img_path)
+                    messages.append(
+                        {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": generated_text}],
+                        }
+                    )
+                    full_history.append(
+                        {
+                            "type": "run_end",
+                            "status": "aborted_repeated_rejection",
+                            "total_rounds": generation_count + 1,
+                            "rejected_prompt": current_text_prompt,
+                            "consecutive_rejection_count": CONSECUTIVE_REJECTION_COUNT,
+                        }
+                    )
+                    _save_full_history()
+                    return messages, final_outputs, rendered_final_output
+
                 print(
-                    f"❌ Text prompt '{current_text_prompt}' has been used before. Requesting a different prompt."
+                    f"❌ Text prompt '{current_text_prompt}' has been used before "
+                    f"(rejection #{CONSECUTIVE_REJECTION_COUNT}). Requesting a different prompt."
                 )
-                duplicate_prompt_message = f"You have previously used '{current_text_prompt}' as your text_prompt to call the segment_phrase tool. You may not use it again. Please call the segment_phrase tool again with a different, perhaps more general, or more creative simple noun phrase prompt, while adhering to all the rules stated in the system prompt. You must also never use any of the following text_prompt(s): {str(list(USED_TEXT_PROMPTS))}."
+                duplicate_prompt_message = (
+                    f"You have previously used '{current_text_prompt}' as your text_prompt "
+                    f"to call the segment_phrase tool (this is rejected attempt "
+                    f"#{CONSECUTIVE_REJECTION_COUNT} with the same phrase). You may not use it again. "
+                    f"Please call the segment_phrase tool again with a different, perhaps more "
+                    f"general, or more creative simple noun phrase prompt, while adhering to all "
+                    f"the rules stated in the system prompt. You must also never use any of the "
+                    f"following text_prompt(s): {sorted(list(USED_TEXT_PROMPTS))}."
+                )
                 messages.append(
                     {
                         "role": "assistant",
@@ -322,6 +378,7 @@ def agent_inference(
                         "type": "duplicate_prompt_rejected",
                         "round": generation_count + 1,
                         "text_prompt": current_text_prompt,
+                        "consecutive_rejection_count": CONSECUTIVE_REJECTION_COUNT,
                         "previously_used": sorted(list(USED_TEXT_PROMPTS)),
                     }
                 )
@@ -330,12 +387,15 @@ def agent_inference(
                 # Add the text_prompt to the set of used prompts
                 USED_TEXT_PROMPTS.add(current_text_prompt)
                 LATEST_SAM3_TEXT_PROMPT = current_text_prompt
+                # Reset consecutive-rejection tracking: a new accepted prompt clears it.
+                LAST_REJECTED_PROMPT = None
+                CONSECUTIVE_REJECTION_COUNT = 0
                 PATH_TO_LATEST_OUTPUT_JSON = call_sam_service(
                     image_path=img_path,
                     text_prompt=current_text_prompt,
                     output_folder_path=run_folder,
                 )
-                sam3_outputs = json.load(open(PATH_TO_LATEST_OUTPUT_JSON, "r"))
+                sam3_outputs = json.load(open(PATH_TO_LATEST_OUTPUT_JSON, "r", encoding="utf-8"))
                 sam3_output_image_path = sam3_outputs["output_image_path"]
                 num_masks = len(sam3_outputs["pred_boxes"])
 
@@ -412,15 +472,37 @@ def agent_inference(
             }
             messages.append(simplified_message)
 
-            current_outputs = json.load(open(PATH_TO_LATEST_OUTPUT_JSON, "r"))
+            current_outputs = json.load(open(PATH_TO_LATEST_OUTPUT_JSON, "r", encoding="utf-8"))
             num_masks = len(current_outputs["pred_masks"])
             masks_to_keep = []
             safe_prompt = LATEST_SAM3_TEXT_PROMPT.replace("/", "_")
             verdicts_log = []
             debug_images_log = []
 
+            if pr_filter_fn is not None and num_masks > 1:
+                image_np = cv2.cvtColor(cv2.imread(img_path), cv2.COLOR_BGR2RGB)
+                h, w = current_outputs["orig_img_h"], current_outputs["orig_img_w"]
+                masks_rle = [
+                    {"size": [h, w], "counts": c}
+                    for c in current_outputs["pred_masks"]
+                ]
+                pr_surviving_indices = pr_filter_fn(image_np, masks_rle, initial_text_prompt, pr_top_k)
+                print(
+                    f"[PR pre-filter] {num_masks} candidates → {len(pr_surviving_indices)} "
+                    f"survivors: {[i+1 for i in pr_surviving_indices]}"
+                )
+                full_history.append({
+                    "type": "pr_prefilter",
+                    "round": generation_count + 1,
+                    "candidates_in": num_masks,
+                    "survivors": [i + 1 for i in pr_surviving_indices],
+                })
+                _save_full_history()
+            else:
+                pr_surviving_indices = list(range(num_masks))
+
             # MLLM check the mask one by one
-            for i in range(num_masks):
+            for i in pr_surviving_indices:
                 print(f"🔍 Checking mask {i + 1}/{num_masks}...")
                 image_w_mask_i, image_w_zoomed_in_mask_i = visualize(current_outputs, i)
 
@@ -578,7 +660,7 @@ def agent_inference(
                 PATH_TO_LATEST_OUTPUT_JSON = base_path.replace(
                     ".json", f"masks_{'_'.join(map(str, masks_to_keep))}.json"
                 )
-            json.dump(updated_outputs, open(PATH_TO_LATEST_OUTPUT_JSON, "w"), indent=4)
+            json.dump(updated_outputs, open(PATH_TO_LATEST_OUTPUT_JSON, "w", encoding="utf-8"), indent=4)
 
             # record examine_each_mask result in full history
             examine_entry = {
@@ -598,7 +680,7 @@ def agent_inference(
 
         elif tool_call["name"] == "select_masks_and_return":
             print("🔍 Calling select_masks_and_return tool...")
-            current_outputs = json.load(open(PATH_TO_LATEST_OUTPUT_JSON, "r"))
+            current_outputs = json.load(open(PATH_TO_LATEST_OUTPUT_JSON, "r", encoding="utf-8"))
 
             assert list(tool_call["parameters"].keys()) == ["final_answer_masks"]
             masks_to_keep = tool_call["parameters"]["final_answer_masks"]
@@ -733,7 +815,7 @@ def agent_inference(
         run_folder,
         f"{image_stem}_error_history.json",
     )
-    with open(error_save_path, "w") as f:
+    with open(error_save_path, "w", encoding="utf-8") as f:
         json.dump(messages, f, indent=4)
     print("Saved messages history that caused error to:", error_save_path)
 
